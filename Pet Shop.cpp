@@ -1,4 +1,4 @@
-﻿#include <iostream>
+#include <iostream>
 #include <fstream>
 #include <vector>
 #include <string>
@@ -321,6 +321,8 @@ private:
             animateDelay(1800);
         }
     }
+
+public:
     //تابع ذخیره سازی کاربران
     void saveUsers() {
         //ذخیره در فایل مشتری ها
@@ -365,7 +367,7 @@ private:
         }
         prodFile.close();
     }
-public:
+
     PetShopSystem() {
         // اصلاح باگ: تنظیم instance
         instance = this;
@@ -446,11 +448,13 @@ public:
 
         if (role == "customer") {
             users.push_back(new Customer(username, password));
+			saveUsers(); // ذخیره‌سازی فوری کاربران
             cout << endl;
             typeWriter("Customer registered successfully!", 50);
         }
         else if (role == "seller") {
             users.push_back(new Seller(username, password));
+            saveUsers(); // ذخیره‌سازی فوری کاربران
             cout << endl;
             typeWriter("Seller registered successfully!", 50);
         }
@@ -474,6 +478,10 @@ public:
             return;
         }
         products.push_back(product);
+        saveProduct(); // ذخیره‌سازی فوری محصولات
+        cout << endl;
+        typeWriter("Product added successfully!", 45);
+        animateDelay(1200);
     }
 
     //حدف محصول
@@ -486,6 +494,7 @@ public:
 
         if (it != products.end()) {
             products.erase(it, products.end());
+            saveProduct(); // ذخیره‌سازی فوری محصولات
             cout << endl;
             typeWriter("Product Removed Successfully.", 50);
         }
@@ -671,6 +680,7 @@ void Customer::displayMenu() {
                     productFound = true;
                     if (makePurchase(Product.GetPrice())) {
                         addOrder(productName);
+						system->saveUsers(); // ذخیره‌سازی فوری کاربران
                         cout << endl;
                         typeWriter("Purchase successful!", 45);
                         cout << "  Toman " << fixed << setprecision(2) << Product.GetPrice() << " deducted from your account." << endl;
