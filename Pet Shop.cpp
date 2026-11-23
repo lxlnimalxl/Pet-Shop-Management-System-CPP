@@ -10,6 +10,19 @@
 #include <thread>
 #include <chrono>
 #include <sstream>
+#include <cstdio>
+#include <stdexcept>
+#include <openssl/crypto.h>
+#include <openssl/evp.h>
+#include <openssl/rand.h>
+
+#ifdef _WIN32
+#define NOMINMAX
+#include <windows.h>
+#undef GetUserName
+#else
+#include <sys/stat.h>
+#endif
 
 using namespace std;
 
@@ -57,26 +70,86 @@ void showName(const string& title) {
     typeWriter(title, 20);
 }
 
+namespace {
+const string passwordFileHeader = "# Pet Shop password hashes v1";
+const int passwordSaltSize = 16;
+const int passwordHashSize = 32;
+const int passwordIterations = 600000;
+
+string toHex(const unsigned char* bytes, int size) {
+    const string digits = "0123456789abcdef";
+    string hex;
+    for (int i = 0; i < size; ++i) {
+        hex += digits[bytes[i] >> 4];
+        hex += digits[bytes[i] & 15];
+    }
+    return hex;
+}
+
+string randomHex() {
+    unsigned char bytes[passwordSaltSize];
+    if (RAND_bytes(bytes, sizeof(bytes)) != 1) {
+        return "";
+    }
+    return toHex(bytes, sizeof(bytes));
+}
+
+// Use the encoded salt directly as the PBKDF2 salt so the stored value can be reused as-is.
+string derivePasswordHash(const string& password, const string& salt) {
+    unsigned char hash[passwordHashSize];
+    if (password.size() > static_cast<size_t>(numeric_limits<int>::max()) ||
+        PKCS5_PBKDF2_HMAC(password.data(), static_cast<int>(password.size()),
+            reinterpret_cast<const unsigned char*>(salt.data()), static_cast<int>(salt.size()),
+            passwordIterations, EVP_sha256(), sizeof(hash), hash) != 1) {
+        throw runtime_error("Could not hash the password.");
+    }
+    return toHex(hash, sizeof(hash));
+}
+
+string hashPassword(const string& password) {
+    string salt = randomHex();
+    if (salt.empty()) {
+        throw runtime_error("Could not generate a password salt.");
+    }
+    return salt + "$" + derivePasswordHash(password, salt);
+}
+
+bool verifyPassword(const string& password, const string& passwordHash) {
+    const size_t saltLength = 2 * passwordSaltSize;
+    const size_t hashLength = 2 * passwordHashSize;
+    if (passwordHash.size() != saltLength + 1 + hashLength || passwordHash[saltLength] != '$') {
+        return false;
+    }
+
+    string hash = derivePasswordHash(password, passwordHash.substr(0, saltLength));
+    return CRYPTO_memcmp(hash.data(), passwordHash.data() + saltLength + 1, hashLength) == 0;
+}
+
+bool replaceFile(const string& source, const string& destination) {
+#ifdef _WIN32
+    return MoveFileExA(source.c_str(), destination.c_str(), MOVEFILE_REPLACE_EXISTING) != 0;
+#else
+    return rename(source.c_str(), destination.c_str()) == 0;
+#endif
+}
+}
+
 class User {
 protected:
     string username;
-    string password;
+    string passwordHash;
     string role;
 public:
     //سازنده
-    User(const string& UserName, const string& PassWord, const string& Role = "user") {
+    User(const string& UserName, const string& PasswordHash, const string& Role = "user") {
         username = UserName;
-        password = PassWord;
+        passwordHash = PasswordHash;
         role = Role;
     }
 
     //ستر
     void SetUserName(const string& UserName) {
         username = UserName;
-    }
-
-    void SetPass(const string& PassWord) {
-        password = PassWord;
     }
 
     void SetRole(const string& Role) {
@@ -90,8 +163,8 @@ public:
     string GetUserName() const {
         return username;
     }
-    string GetPassWord() const {
-        return password;
+    const string& GetPasswordHash() const {
+        return passwordHash;
     }
     string GetRole() const {
         return role;
@@ -106,8 +179,8 @@ private:
     vector<string> orders;
 public:
     //سازنده
-    Customer(const string& UserName, const string& PassWord, double Balance = 0.0) :
-        User(UserName, PassWord, "customer"), balance(Balance) {
+    Customer(const string& UserName, const string& PasswordHash, double Balance = 0.0) :
+        User(UserName, PasswordHash, "customer"), balance(Balance) {
     }
     //ستر
     void SetBalance(double Balance) {
@@ -156,8 +229,8 @@ public:
 class Seller : public User {
 public:
     //سازنده
-    Seller(const string& UserName, const string& PassWord) :
-        User(UserName, PassWord, "seller") {
+    Seller(const string& UserName, const string& PasswordHash) :
+        User(UserName, PasswordHash, "seller") {
     }
     //نمایش منو فرشنده
     void displayMenu() override;
@@ -234,54 +307,109 @@ private:
     }
 
     //تابع بارگزاری کاربران
-    void LoadUsers() {
-        // اصلاح باگ: ایجاد فایل‌های خالی در صورت عدم وجود
-        ofstream createCustFile(customersFile, ios::app);
-        createCustFile.close();
-        ofstream createSellFile(sellersFile, ios::app);
-        createSellFile.close();
+    void LoadUsers(const string& fileName, const string& role) {
+        ofstream createFile(fileName, ios::app);
+        createFile.close();
+        ifstream file(fileName);
+        if (!file) {
+            throw runtime_error("Could not open " + fileName + ".");
+        }
 
-        ifstream custFile(customersFile);
-        //شرطی که نگاه کنه فایل به درستی باز شده یا نه
-        if (custFile) {
-            string UserName, PassWord;
-            double Balance;
-            while (custFile >> UserName >> PassWord >> Balance) {
-                // اصلاح باگ: بارگذاری سفارش‌ها
+        string line;
+        bool hasHashes = false;
+        bool hasAccounts = false;
+        while (getline(file, line)) {
+            if (!line.empty() && line.back() == '\r') {
+                line.pop_back();
+            }
+            if (line.find_first_not_of(" \t") == string::npos) {
+                continue;
+            }
+            if (!hasAccounts && line == passwordFileHeader) {
+                hasHashes = true;
+                continue;
+            }
+
+            istringstream record(line);
+            string username, credential;
+            if (!(record >> username >> credential)) {
+                throw runtime_error("Invalid account record in " + fileName + ".");
+            }
+            string passwordHash = hasHashes ? credential : hashPassword(credential);
+            if (role == "customer") {
+                double balance;
+                if (!(record >> balance)) {
+                    throw runtime_error("Invalid customer balance in " + fileName + ".");
+                }
                 vector<string> orders;
                 string order;
-                custFile >> ws; // حذف فاصله‌های اضافی
-                getline(custFile, order);
-                stringstream ss(order);
-                string item;
-                while (getline(ss, item, ' ')) {
-                    if (!item.empty()) orders.push_back(unescapeCommas(item));
+                record >> ws;
+                while (getline(record, order, ' ')) {
+                    if (!order.empty()) orders.push_back(unescapeCommas(order));
                 }
-                Customer* customer = new Customer(UserName, PassWord, Balance);
+                Customer* customer = new Customer(username, passwordHash, balance);
                 customer->SetOreders(orders);
                 users.push_back(customer);
             }
-            custFile.close();
-        }
-        else {
-            // اصلاح باگ: اطلاع‌رسانی در صورت باز نشدن فایل
-            typeWriter("Error: Could not open customers file!", 50);
-            animateDelay(1800);
-        }
-        ifstream sellFile(sellersFile);
-        //شرطی که نگاه کنه فایل به درستی باز شده یا نه
-        if (sellFile) {
-            string UserName, PassWord;
-            while (sellFile >> UserName >> PassWord) {
-                users.push_back(new Seller(UserName, PassWord));
+            else {
+                if (!(record >> ws).eof()) {
+                    throw runtime_error("Invalid seller record in " + fileName + ".");
+                }
+                users.push_back(new Seller(username, passwordHash));
             }
-            sellFile.close();
+            hasAccounts = true;
         }
-        else {
-            // اصلاح باگ: اطلاع‌رسانی در صورت باز نشدن فایل
-            typeWriter("Error: Could not open sellers file!", 50);
-            animateDelay(1800);
+        if (file.bad()) {
+            throw runtime_error("Could not read " + fileName + ".");
         }
+        file.close();
+
+        if (hasAccounts && !hasHashes && !saveUsers(fileName, role)) {
+            throw runtime_error("Could not upgrade passwords in " + fileName + ".");
+        }
+    }
+
+    bool saveUsers(const string& fileName, const string& role) {
+        string suffix = randomHex();
+        if (suffix.empty()) {
+            return false;
+        }
+        string tempName = fileName + "." + suffix + ".tmp";
+        ofstream file(tempName);
+        if (!file) {
+            return false;
+        }
+#ifndef _WIN32
+        if (chmod(tempName.c_str(), S_IRUSR | S_IWUSR) != 0) {
+            file.close();
+            remove(tempName.c_str());
+            return false;
+        }
+#endif
+
+        file << passwordFileHeader << '\n';
+        file << setprecision(numeric_limits<double>::max_digits10);
+        for (const auto& user : users) {
+            if (user->GetRole() != role) {
+                continue;
+            }
+            file << user->GetUserName() << " " << user->GetPasswordHash();
+            if (role == "customer") {
+                const Customer* customer = static_cast<const Customer*>(user);
+                file << " " << customer->GetBalance();
+                for (const auto& order : customer->GetOreders()) {
+                    file << " " << escapeCommas(order);
+                }
+            }
+            file << '\n';
+        }
+        file.close();
+
+        if (file && replaceFile(tempName, fileName)) {
+            return true;
+        }
+        remove(tempName.c_str());
+        return false;
     }
     //تابع بارگزاری اطلاعات محصولات
     void LoadProduct() {
@@ -325,35 +453,12 @@ private:
 public:
     //تابع ذخیره سازی کاربران
     void saveUsers() {
-        //ذخیره در فایل مشتری ها
-        ofstream custFile(customersFile);
-        //پیمایش اطلاعات
-        for (const auto& User : users) {
-            //بررسی اینکه کاربر مشتری هست یا نه
-            if (User->GetRole() == "customer") {
-                //تبدیل یوزر به مشتری 
-                //dynamic_cast = تبدیل اشاره گر از نوع کلاس پایه به کلاس مشتق شده
-                Customer* customer = dynamic_cast<Customer*>(User);
-                custFile << customer->GetUserName() << " " << customer->GetPassWord() << " " << customer->GetBalance();
-                // اصلاح باگ: ذخیره‌سازی سفارش‌ها
-                for (const auto& order : customer->GetOreders()) {
-                    custFile << " " << escapeCommas(order);
-                }
-                custFile << endl;
-            }
+        if (!saveUsers(customersFile, "customer")) {
+            typeWriter("Error: Could not save customers file!", 50);
         }
-        custFile.close();
-
-        //ذخیره در فایل فروشنده ها
-        ofstream sellFile(sellersFile);
-        //پیمایش اطلاعات
-        for (const auto& User : users) {
-            //شرط اینکه فروشنده ها است یا نه
-            if (User->GetRole() == "seller") {
-                sellFile << User->GetUserName() << " " << User->GetPassWord() << endl;
-            }
+        if (!saveUsers(sellersFile, "seller")) {
+            typeWriter("Error: Could not save sellers file!", 50);
         }
-        sellFile.close();
     }
     //تابع ذخیره سازی محصولات
     void saveProduct() {
@@ -373,7 +478,8 @@ public:
         instance = this;
         showName("Loading System Data...");
         animateDelay(900);
-        LoadUsers();
+        LoadUsers(customersFile, "customer");
+        LoadUsers(sellersFile, "seller");
         LoadProduct();
         typeWriter("System ready!", 80);
         animateDelay(800);
@@ -408,7 +514,7 @@ public:
         cin >> password;
         //جست و جوی کاربر
         for (auto User : users) {
-            if (User->GetUserName() == username && User->GetPassWord() == password) {
+            if (User->GetUserName() == username && verifyPassword(password, User->GetPasswordHash())) {
                 cout << endl;
                 typeWriter("Login successful!", 40);
                 animateDelay(1200);
@@ -433,7 +539,7 @@ public:
         //تبدیل به حروف کوچک
         //cctype کتابخونه
         for (char& c : role) {
-            c = tolower(c);
+            c = tolower(static_cast<unsigned char>(c));
         }
 
         //جستجو برای وجود یوزر
@@ -446,21 +552,38 @@ public:
             }
         }
 
-        if (role == "customer") {
-            users.push_back(new Customer(username, password));
-			saveUsers(); // ذخیره‌سازی فوری کاربران
-            cout << endl;
-            typeWriter("Customer registered successfully!", 50);
-        }
-        else if (role == "seller") {
-            users.push_back(new Seller(username, password));
-            saveUsers(); // ذخیره‌سازی فوری کاربران
-            cout << endl;
-            typeWriter("Seller registered successfully!", 50);
-        }
-        else {
+        if (role != "customer" && role != "seller") {
             cout << endl;
             typeWriter("Invalid role!", 50);
+            animateDelay(1800);
+            return;
+        }
+
+        string passwordHash;
+        try {
+            passwordHash = hashPassword(password);
+        }
+        catch (const runtime_error& error) {
+            typeWriter(string("Error: ") + error.what(), 50);
+            animateDelay(1800);
+            return;
+        }
+
+        bool isCustomer = role == "customer";
+        if (isCustomer) {
+            users.push_back(new Customer(username, passwordHash));
+        }
+        else {
+            users.push_back(new Seller(username, passwordHash));
+        }
+        cout << endl;
+        if (saveUsers(isCustomer ? customersFile : sellersFile, role)) {
+            typeWriter(isCustomer ? "Customer registered successfully!" : "Seller registered successfully!", 50);
+        }
+        else {
+            delete users.back();
+            users.pop_back();
+            typeWriter("Error: Could not save the new account!", 50);
         }
         animateDelay(1800);
     }
@@ -851,7 +974,7 @@ void Seller::displayMenu() {
     } while (choice != 0);
 }
 
-int main() {
+int main() try {
     // اصلاح باگ: استفاده از Singleton به جای ایجاد مستقیم شیء
     PetShopSystem* PetShop = PetShopSystem::GetInstance();
 
@@ -897,4 +1020,8 @@ int main() {
     } while (MainChoice != 0);
 
     return 0;
+}
+catch (const exception& error) {
+    cerr << "Error: " << error.what() << endl;
+    return 1;
 }

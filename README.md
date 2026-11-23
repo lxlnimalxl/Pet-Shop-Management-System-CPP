@@ -19,6 +19,7 @@ This console-based application supports customer and seller roles, account manag
 * **User registration and login**
 * Two roles: `Customer` and `Seller`
 * Password-protected access with role-based dashboards
+* Passwords stored as salted PBKDF2-HMAC-SHA256 hashes
 
 ### 💼 Customers
 
@@ -79,11 +80,11 @@ This console-based application supports customer and seller roles, account manag
 
 ## 🚀 How to Run
 
-1. Make sure you have a C++ compiler (e.g., `g++`)
+1. Install a C++ compiler (e.g., `g++`) and the OpenSSL development headers and libraries.
 2. Compile the file:
 
    ```bash
-   g++ -std=c++11 -o petshop main.cpp
+   g++ -std=c++11 -pthread -o petshop "Pet Shop.cpp" -lcrypto
    ```
 3. Run:
 
@@ -98,14 +99,18 @@ This console-based application supports customer and seller roles, account manag
 ### `customers.txt`
 
 ```
-john123 pass123 500.00 toy,collar
+# Pet Shop password hashes v1
+john123 <salt>$<hash> 500.00 toy collar
 ```
 
 ### `sellers.txt`
 
 ```
-admin1 adminpass
+# Pet Shop password hashes v1
+admin1 <salt>$<hash>
 ```
+
+The app generates each salt and hash and upgrades existing plaintext account files on startup. Existing usernames and passwords still work.
 
 ### `products.txt`
 
@@ -126,7 +131,6 @@ Dog Food,Food,Dogs,120.50
 
 ## 🔐 Future Improvements
 
-* Password encryption
 * Admin panel
 * Graphical UI (Qt / SDL)
 * Product sorting and filtering
