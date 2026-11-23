@@ -19,11 +19,12 @@ This console-based application supports customer and seller roles, account manag
 * **User registration and login**
 * Two roles: `Customer` and `Seller`
 * Password-protected access with role-based dashboards
+* Passwords stored as salted PBKDF2-HMAC-SHA256 hashes
 
 ### 💼 Customers
 
 * View product catalog
-* Search for products (by name, category, price range)
+* Filter and sort products
 * Charge account balance
 * Purchase products (with balance deduction)
 * View personal orders and remaining balance
@@ -32,6 +33,7 @@ This console-based application supports customer and seller roles, account manag
 
 * Add new products (with validation)
 * View and remove products
+* Filter and sort products
 * See registered customers
 
 ### 💾 Persistent Storage
@@ -79,11 +81,11 @@ This console-based application supports customer and seller roles, account manag
 
 ## 🚀 How to Run
 
-1. Make sure you have a C++ compiler (e.g., `g++`)
+1. Install a C++ compiler (e.g., `g++`) and the OpenSSL development headers and libraries.
 2. Compile the file:
 
    ```bash
-   g++ -std=c++11 -o petshop main.cpp
+   g++ -std=c++11 -pthread -o petshop "Pet Shop.cpp" -lcrypto
    ```
 3. Run:
 
@@ -98,14 +100,18 @@ This console-based application supports customer and seller roles, account manag
 ### `customers.txt`
 
 ```
-john123 pass123 500.00 toy,collar
+# Pet Shop password hashes v1
+john123 <salt>$<hash> 500.00 toy collar
 ```
 
 ### `sellers.txt`
 
 ```
-admin1 adminpass
+# Pet Shop password hashes v1
+admin1 <salt>$<hash>
 ```
+
+The app generates each salt and hash and upgrades existing plaintext account files on startup. Existing usernames and passwords still work.
 
 ### `products.txt`
 
@@ -115,9 +121,16 @@ Dog Food,Food,Dogs,120.50
 
 ---
 
+## 🔎 Filtering and Sorting Products
+
+Choose **Filter and Sort Products** from either dashboard. Combine partial matches for product name, category, and suitable pet with an inclusive price range. Text filters ignore case for ASCII letters. Leave a field blank to skip that filter.
+
+Sort results by name (A–Z) or by price in either direction. Leave the sort option blank to use catalog order.
+
+---
+
 ## 📌 Notes
 
-* Product search supports **partial matches** for names and categories.
 * Invalid input is handled with clear error messages.
 * Commas in product names/categories are replaced with semicolons for file safety.
 * Orders are saved per customer and loaded at startup.
@@ -126,10 +139,8 @@ Dog Food,Food,Dogs,120.50
 
 ## 🔐 Future Improvements
 
-* Password encryption
 * Admin panel
 * Graphical UI (Qt / SDL)
-* Product sorting and filtering
 * More pet types and categories
 
 ---

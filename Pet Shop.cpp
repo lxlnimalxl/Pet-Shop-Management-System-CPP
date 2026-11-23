@@ -10,6 +10,20 @@
 #include <thread>
 #include <chrono>
 #include <sstream>
+#include <cmath>
+#include <cstdio>
+#include <stdexcept>
+#include <openssl/crypto.h>
+#include <openssl/evp.h>
+#include <openssl/rand.h>
+
+#ifdef _WIN32
+#define NOMINMAX
+#include <windows.h>
+#undef GetUserName
+#else
+#include <sys/stat.h>
+#endif
 
 using namespace std;
 
@@ -57,26 +71,120 @@ void showName(const string& title) {
     typeWriter(title, 20);
 }
 
+namespace {
+const string passwordFileHeader = "# Pet Shop password hashes v1";
+const int passwordSaltSize = 16;
+const int passwordHashSize = 32;
+const int passwordIterations = 600000;
+
+string toHex(const unsigned char* bytes, int size) {
+    const string digits = "0123456789abcdef";
+    string hex;
+    for (int i = 0; i < size; ++i) {
+        hex += digits[bytes[i] >> 4];
+        hex += digits[bytes[i] & 15];
+    }
+    return hex;
+}
+
+string randomHex() {
+    unsigned char bytes[passwordSaltSize];
+    if (RAND_bytes(bytes, sizeof(bytes)) != 1) {
+        return "";
+    }
+    return toHex(bytes, sizeof(bytes));
+}
+
+// Use the encoded salt directly as the PBKDF2 salt so the stored value can be reused as-is.
+string derivePasswordHash(const string& password, const string& salt) {
+    unsigned char hash[passwordHashSize];
+    if (password.size() > static_cast<size_t>(numeric_limits<int>::max()) ||
+        PKCS5_PBKDF2_HMAC(password.data(), static_cast<int>(password.size()),
+            reinterpret_cast<const unsigned char*>(salt.data()), static_cast<int>(salt.size()),
+            passwordIterations, EVP_sha256(), sizeof(hash), hash) != 1) {
+        throw runtime_error("Could not hash the password.");
+    }
+    return toHex(hash, sizeof(hash));
+}
+
+string hashPassword(const string& password) {
+    string salt = randomHex();
+    if (salt.empty()) {
+        throw runtime_error("Could not generate a password salt.");
+    }
+    return salt + "$" + derivePasswordHash(password, salt);
+}
+
+bool verifyPassword(const string& password, const string& passwordHash) {
+    const size_t saltLength = 2 * passwordSaltSize;
+    const size_t hashLength = 2 * passwordHashSize;
+    if (passwordHash.size() != saltLength + 1 + hashLength || passwordHash[saltLength] != '$') {
+        return false;
+    }
+
+    string hash = derivePasswordHash(password, passwordHash.substr(0, saltLength));
+    return CRYPTO_memcmp(hash.data(), passwordHash.data() + saltLength + 1, hashLength) == 0;
+}
+
+bool replaceFile(const string& source, const string& destination) {
+#ifdef _WIN32
+    return MoveFileExA(source.c_str(), destination.c_str(), MOVEFILE_REPLACE_EXISTING) != 0;
+#else
+    return rename(source.c_str(), destination.c_str()) == 0;
+#endif
+}
+
+string toLower(string text) {
+    for (char& c : text) {
+        c = tolower(static_cast<unsigned char>(c));
+    }
+    return text;
+}
+
+bool readPriceFilter(const string& prompt, double minimum, double& price) {
+    string line;
+    while (true) {
+        cout << prompt;
+        if (!getline(cin, line)) {
+            return false;
+        }
+
+        istringstream input(line);
+        if ((input >> ws).eof()) {
+            return true;
+        }
+
+        double value;
+        if (!(input >> value) || !(input >> ws).eof() || !isfinite(value) || value < 0) {
+            typeWriter("Enter a valid non-negative price.", 50);
+        }
+        else if (value < minimum) {
+            typeWriter("Maximum price cannot be less than the minimum price.", 50);
+        }
+        else {
+            price = value;
+            return true;
+        }
+    }
+}
+}
+
 class User {
 protected:
     string username;
-    string password;
+    string passwordHash;
     string role;
 public:
     //سازنده
-    User(const string& UserName, const string& PassWord, const string& Role = "user") {
+    User(const string& UserName, const string& PasswordHash, const string& Role = "user") {
         username = UserName;
-        password = PassWord;
+        passwordHash = PasswordHash;
         role = Role;
     }
 
     //ستر
     void SetUserName(const string& UserName) {
         username = UserName;
-    }
-
-    void SetPass(const string& PassWord) {
-        password = PassWord;
     }
 
     void SetRole(const string& Role) {
@@ -90,8 +198,8 @@ public:
     string GetUserName() const {
         return username;
     }
-    string GetPassWord() const {
-        return password;
+    const string& GetPasswordHash() const {
+        return passwordHash;
     }
     string GetRole() const {
         return role;
@@ -106,8 +214,8 @@ private:
     vector<string> orders;
 public:
     //سازنده
-    Customer(const string& UserName, const string& PassWord, double Balance = 0.0) :
-        User(UserName, PassWord, "customer"), balance(Balance) {
+    Customer(const string& UserName, const string& PasswordHash, double Balance = 0.0) :
+        User(UserName, PasswordHash, "customer"), balance(Balance) {
     }
     //ستر
     void SetBalance(double Balance) {
@@ -156,8 +264,8 @@ public:
 class Seller : public User {
 public:
     //سازنده
-    Seller(const string& UserName, const string& PassWord) :
-        User(UserName, PassWord, "seller") {
+    Seller(const string& UserName, const string& PasswordHash) :
+        User(UserName, PasswordHash, "seller") {
     }
     //نمایش منو فرشنده
     void displayMenu() override;
@@ -234,54 +342,109 @@ private:
     }
 
     //تابع بارگزاری کاربران
-    void LoadUsers() {
-        // اصلاح باگ: ایجاد فایل‌های خالی در صورت عدم وجود
-        ofstream createCustFile(customersFile, ios::app);
-        createCustFile.close();
-        ofstream createSellFile(sellersFile, ios::app);
-        createSellFile.close();
+    void LoadUsers(const string& fileName, const string& role) {
+        ofstream createFile(fileName, ios::app);
+        createFile.close();
+        ifstream file(fileName);
+        if (!file) {
+            throw runtime_error("Could not open " + fileName + ".");
+        }
 
-        ifstream custFile(customersFile);
-        //شرطی که نگاه کنه فایل به درستی باز شده یا نه
-        if (custFile) {
-            string UserName, PassWord;
-            double Balance;
-            while (custFile >> UserName >> PassWord >> Balance) {
-                // اصلاح باگ: بارگذاری سفارش‌ها
+        string line;
+        bool hasHashes = false;
+        bool hasAccounts = false;
+        while (getline(file, line)) {
+            if (!line.empty() && line.back() == '\r') {
+                line.pop_back();
+            }
+            if (line.find_first_not_of(" \t") == string::npos) {
+                continue;
+            }
+            if (!hasAccounts && line == passwordFileHeader) {
+                hasHashes = true;
+                continue;
+            }
+
+            istringstream record(line);
+            string username, credential;
+            if (!(record >> username >> credential)) {
+                throw runtime_error("Invalid account record in " + fileName + ".");
+            }
+            string passwordHash = hasHashes ? credential : hashPassword(credential);
+            if (role == "customer") {
+                double balance;
+                if (!(record >> balance)) {
+                    throw runtime_error("Invalid customer balance in " + fileName + ".");
+                }
                 vector<string> orders;
                 string order;
-                custFile >> ws; // حذف فاصله‌های اضافی
-                getline(custFile, order);
-                stringstream ss(order);
-                string item;
-                while (getline(ss, item, ' ')) {
-                    if (!item.empty()) orders.push_back(unescapeCommas(item));
+                record >> ws;
+                while (getline(record, order, ' ')) {
+                    if (!order.empty()) orders.push_back(unescapeCommas(order));
                 }
-                Customer* customer = new Customer(UserName, PassWord, Balance);
+                Customer* customer = new Customer(username, passwordHash, balance);
                 customer->SetOreders(orders);
                 users.push_back(customer);
             }
-            custFile.close();
-        }
-        else {
-            // اصلاح باگ: اطلاع‌رسانی در صورت باز نشدن فایل
-            typeWriter("Error: Could not open customers file!", 50);
-            animateDelay(1800);
-        }
-        ifstream sellFile(sellersFile);
-        //شرطی که نگاه کنه فایل به درستی باز شده یا نه
-        if (sellFile) {
-            string UserName, PassWord;
-            while (sellFile >> UserName >> PassWord) {
-                users.push_back(new Seller(UserName, PassWord));
+            else {
+                if (!(record >> ws).eof()) {
+                    throw runtime_error("Invalid seller record in " + fileName + ".");
+                }
+                users.push_back(new Seller(username, passwordHash));
             }
-            sellFile.close();
+            hasAccounts = true;
         }
-        else {
-            // اصلاح باگ: اطلاع‌رسانی در صورت باز نشدن فایل
-            typeWriter("Error: Could not open sellers file!", 50);
-            animateDelay(1800);
+        if (file.bad()) {
+            throw runtime_error("Could not read " + fileName + ".");
         }
+        file.close();
+
+        if (hasAccounts && !hasHashes && !saveUsers(fileName, role)) {
+            throw runtime_error("Could not upgrade passwords in " + fileName + ".");
+        }
+    }
+
+    bool saveUsers(const string& fileName, const string& role) {
+        string suffix = randomHex();
+        if (suffix.empty()) {
+            return false;
+        }
+        string tempName = fileName + "." + suffix + ".tmp";
+        ofstream file(tempName);
+        if (!file) {
+            return false;
+        }
+#ifndef _WIN32
+        if (chmod(tempName.c_str(), S_IRUSR | S_IWUSR) != 0) {
+            file.close();
+            remove(tempName.c_str());
+            return false;
+        }
+#endif
+
+        file << passwordFileHeader << '\n';
+        file << setprecision(numeric_limits<double>::max_digits10);
+        for (const auto& user : users) {
+            if (user->GetRole() != role) {
+                continue;
+            }
+            file << user->GetUserName() << " " << user->GetPasswordHash();
+            if (role == "customer") {
+                const Customer* customer = static_cast<const Customer*>(user);
+                file << " " << customer->GetBalance();
+                for (const auto& order : customer->GetOreders()) {
+                    file << " " << escapeCommas(order);
+                }
+            }
+            file << '\n';
+        }
+        file.close();
+
+        if (file && replaceFile(tempName, fileName)) {
+            return true;
+        }
+        remove(tempName.c_str());
+        return false;
     }
     //تابع بارگزاری اطلاعات محصولات
     void LoadProduct() {
@@ -325,35 +488,12 @@ private:
 public:
     //تابع ذخیره سازی کاربران
     void saveUsers() {
-        //ذخیره در فایل مشتری ها
-        ofstream custFile(customersFile);
-        //پیمایش اطلاعات
-        for (const auto& User : users) {
-            //بررسی اینکه کاربر مشتری هست یا نه
-            if (User->GetRole() == "customer") {
-                //تبدیل یوزر به مشتری 
-                //dynamic_cast = تبدیل اشاره گر از نوع کلاس پایه به کلاس مشتق شده
-                Customer* customer = dynamic_cast<Customer*>(User);
-                custFile << customer->GetUserName() << " " << customer->GetPassWord() << " " << customer->GetBalance();
-                // اصلاح باگ: ذخیره‌سازی سفارش‌ها
-                for (const auto& order : customer->GetOreders()) {
-                    custFile << " " << escapeCommas(order);
-                }
-                custFile << endl;
-            }
+        if (!saveUsers(customersFile, "customer")) {
+            typeWriter("Error: Could not save customers file!", 50);
         }
-        custFile.close();
-
-        //ذخیره در فایل فروشنده ها
-        ofstream sellFile(sellersFile);
-        //پیمایش اطلاعات
-        for (const auto& User : users) {
-            //شرط اینکه فروشنده ها است یا نه
-            if (User->GetRole() == "seller") {
-                sellFile << User->GetUserName() << " " << User->GetPassWord() << endl;
-            }
+        if (!saveUsers(sellersFile, "seller")) {
+            typeWriter("Error: Could not save sellers file!", 50);
         }
-        sellFile.close();
     }
     //تابع ذخیره سازی محصولات
     void saveProduct() {
@@ -373,7 +513,8 @@ public:
         instance = this;
         showName("Loading System Data...");
         animateDelay(900);
-        LoadUsers();
+        LoadUsers(customersFile, "customer");
+        LoadUsers(sellersFile, "seller");
         LoadProduct();
         typeWriter("System ready!", 80);
         animateDelay(800);
@@ -408,7 +549,7 @@ public:
         cin >> password;
         //جست و جوی کاربر
         for (auto User : users) {
-            if (User->GetUserName() == username && User->GetPassWord() == password) {
+            if (User->GetUserName() == username && verifyPassword(password, User->GetPasswordHash())) {
                 cout << endl;
                 typeWriter("Login successful!", 40);
                 animateDelay(1200);
@@ -431,10 +572,7 @@ public:
         cout << "  Role(customer/seller): ";
         cin >> role;
         //تبدیل به حروف کوچک
-        //cctype کتابخونه
-        for (char& c : role) {
-            c = tolower(c);
-        }
+        role = toLower(role);
 
         //جستجو برای وجود یوزر
         for (const auto& User : users) {
@@ -446,21 +584,38 @@ public:
             }
         }
 
-        if (role == "customer") {
-            users.push_back(new Customer(username, password));
-			saveUsers(); // ذخیره‌سازی فوری کاربران
-            cout << endl;
-            typeWriter("Customer registered successfully!", 50);
-        }
-        else if (role == "seller") {
-            users.push_back(new Seller(username, password));
-            saveUsers(); // ذخیره‌سازی فوری کاربران
-            cout << endl;
-            typeWriter("Seller registered successfully!", 50);
-        }
-        else {
+        if (role != "customer" && role != "seller") {
             cout << endl;
             typeWriter("Invalid role!", 50);
+            animateDelay(1800);
+            return;
+        }
+
+        string passwordHash;
+        try {
+            passwordHash = hashPassword(password);
+        }
+        catch (const runtime_error& error) {
+            typeWriter(string("Error: ") + error.what(), 50);
+            animateDelay(1800);
+            return;
+        }
+
+        bool isCustomer = role == "customer";
+        if (isCustomer) {
+            users.push_back(new Customer(username, passwordHash));
+        }
+        else {
+            users.push_back(new Seller(username, passwordHash));
+        }
+        cout << endl;
+        if (saveUsers(isCustomer ? customersFile : sellersFile, role)) {
+            typeWriter(isCustomer ? "Customer registered successfully!" : "Seller registered successfully!", 50);
+        }
+        else {
+            delete users.back();
+            users.pop_back();
+            typeWriter("Error: Could not save the new account!", 50);
         }
         animateDelay(1800);
     }
@@ -517,17 +672,82 @@ public:
     }
 
     void displayProducts() const {
+        displayProducts(products, "No products available in the shop.");
+    }
+
+    void filterAndSortProducts() const {
+        string name, category, suitableFor;
+        cin.ignore(numeric_limits<streamsize>::max(), '\n');
+        cout << "  Product name (leave empty to skip): ";
+        getline(cin, name);
+        cout << "  Category (leave empty to skip): ";
+        getline(cin, category);
+        cout << "  Suitable for which pets (leave empty to skip): ";
+        getline(cin, suitableFor);
+        name = toLower(name);
+        category = toLower(category);
+        suitableFor = toLower(suitableFor);
+
+        double minPrice = 0, maxPrice = numeric_limits<double>::max();
+        if (!readPriceFilter("  Minimum price (leave empty to skip): ", 0, minPrice) ||
+            !readPriceFilter("  Maximum price (leave empty to skip): ", minPrice, maxPrice)) {
+            return;
+        }
+
+        cout << "\n  1. Name (A-Z)" << endl;
+        cout << "  2. Price (low to high)" << endl;
+        cout << "  3. Price (high to low)" << endl;
+        string order;
+        while (true) {
+            cout << "  Sort by (leave empty for catalog order): ";
+            if (!getline(cin, order)) {
+                return;
+            }
+            if (order.empty() || order == "1" || order == "2" || order == "3") {
+                break;
+            }
+            typeWriter("Invalid sort option! Please try again.", 50);
+        }
+
+        vector<Product> matches;
+        for (const auto& product : products) {
+            if (toLower(product.GetName()).find(name) != string::npos &&
+                toLower(product.GetCategory()).find(category) != string::npos &&
+                toLower(product.GetSuitablefor()).find(suitableFor) != string::npos &&
+                product.GetPrice() >= minPrice && product.GetPrice() <= maxPrice) {
+                matches.push_back(product);
+            }
+        }
+
+        if (order == "1") {
+            stable_sort(matches.begin(), matches.end(), [](const Product& first, const Product& second) {
+                return toLower(first.GetName()) < toLower(second.GetName());
+                });
+        }
+        else if (!order.empty()) {
+            stable_sort(matches.begin(), matches.end(), [&order](const Product& first, const Product& second) {
+                return order == "2" ? first.GetPrice() < second.GetPrice() : first.GetPrice() > second.GetPrice();
+                });
+        }
+
+        displayProducts(matches, "No products found with these criteria.");
+        cout << "\nPress Enter to continue...";
+        cin.get();
+    }
+
+private:
+    void displayProducts(const vector<Product>& catalog, const string& emptyMessage) const {
         //خالی بودن محصولات
-        if (products.empty()) {
+        if (catalog.empty()) {
             cout << endl;
-            typeWriter("No products available in the shop.", 50);
+            typeWriter(emptyMessage, 50);
             return;
         }
 
         cout << "\n  " << left << setw(25) << "PRODUCT NAME" << " | " << setw(15) << "CATEGORY" << " | " << setw(20) << "SUITABLE FOR" << " | " << setw(10) << "PRICE" << endl;
         cout << "  " << string(80, '-') << endl;
         //نمایش اطلاعات
-        for (const auto& Product : products) {
+        for (const auto& Product : catalog) {
             Product.display();
             animateDelay(80);
         }
@@ -547,7 +767,7 @@ void Customer::displayMenu() {
         showName("CUSTOMER DASHBOARD");
         cout << "  Welcome, " << username << "!\n" << endl;
         cout << "  1. View Products" << endl;
-        cout << "  2. Search Products" << endl;
+        cout << "  2. Filter and Sort Products" << endl;
         cout << "  3. Charge Account" << endl;
         cout << "  4. Purchase Product" << endl;
         cout << "  5. View Orders" << endl;
@@ -573,83 +793,8 @@ void Customer::displayMenu() {
             break;
         }
         case 2: {
-            showName("PRODUCT SEARCH");
-            string name, category;
-            //کتابخونه limits
-            //numeric_limits بیشترین مقدار رابرای ما برمیگردونه
-            double minPrice = 0, maxPrice = numeric_limits<double>::max();
-
-            cout << "  Product name (leave empty to skip): ";
-            cin.ignore();
-            getline(cin, name);
-
-            cout << "  Category (leave empty to skip): ";
-            getline(cin, category);
-
-            //میمینیم
-            cout << "  Minimum price: ";
-            string minPriceStr;
-            getline(cin, minPriceStr);
-
-            // اصلاح باگ: مدیریت ورودی نامعتبر برای قیمت
-            if (!minPriceStr.empty()) {
-                try {
-                    minPrice = stod(minPriceStr);
-                }
-                catch (const std::exception& e) {
-                    typeWriter("Invalid minimum price! Using default.", 50);
-                    minPrice = 0;
-                }
-            }
-            //ماکسیمم
-            cout << "  Miximum price: ";
-            string maxPriceStr;
-            getline(cin, maxPriceStr);
-            //.empty = بررسی اینکه شی خالی هست یا نه
-            if (!maxPriceStr.empty()) {
-                try {
-                    maxPrice = stod(maxPriceStr);
-                }
-                catch (const std::exception& e) {
-                    typeWriter("Invalid maximum price! Using default.", 50);
-                    maxPrice = numeric_limits<double>::max();
-                }
-            }
-
-            cout << "\n  " << string(50, '=') << endl;
-            cout << "  SEARCH RESULTS" << endl;
-            cout << "  " << string(50, '=') << endl;
-
-            //جست و جو بر اساس اسم دسته بازه محصول
-            // اصلاح باگ: تنظیم صحیح متغیر found
-            bool found = false;
-            for (const auto& product : system->GetProduct()) {
-                bool match = true;
-                //شرط بررسی اسم محصول
-                //npos = نشانه عدم یافتن زیر رشته
-                if (!name.empty() && product.GetName().find(name) == string::npos) {
-                    match = false;
-                }
-                //npos = نشانه عدم یافتن زیر رشته
-                if (!category.empty() && product.GetCategory().find(category) == string::npos) {
-                    match = false;
-                }
-                //npos = نشانه عدم یافتن زیر رشته
-                if (product.GetPrice() < minPrice || product.GetPrice() > maxPrice) {
-                    match = false;
-                }
-                if (match) {
-                    product.display();
-                    found = true;
-                }
-            }
-
-            if (!found) {
-                typeWriter("No products found with these criteria.", 50);
-            }
-
-            cout << "\nPress Enter to continue...";
-            cin.get();
+            showName("FILTER AND SORT PRODUCTS");
+            system->filterAndSortProducts();
             break;
         }
         case 3: {
@@ -754,6 +899,7 @@ void Seller::displayMenu() {
         cout << "  2. View Products" << endl;
         cout << "  3. Remove Product" << endl;
         cout << "  4. View Customers" << endl;
+        cout << "  5. Filter and Sort Products" << endl;
         cout << "  0. Logout" << endl;
         cout << "\n  Enter your choice: ";
         // اصلاح باگ: مدیریت ورودی نامعتبر
@@ -836,6 +982,11 @@ void Seller::displayMenu() {
             cin.get();
             break;
         }
+        case 5: {
+            showName("FILTER AND SORT PRODUCTS");
+            system->filterAndSortProducts();
+            break;
+        }
         case 0: {
             cout << endl;
             typeWriter("Logging out...", 50);
@@ -851,7 +1002,7 @@ void Seller::displayMenu() {
     } while (choice != 0);
 }
 
-int main() {
+int main() try {
     // اصلاح باگ: استفاده از Singleton به جای ایجاد مستقیم شیء
     PetShopSystem* PetShop = PetShopSystem::GetInstance();
 
@@ -897,4 +1048,8 @@ int main() {
     } while (MainChoice != 0);
 
     return 0;
+}
+catch (const exception& error) {
+    cerr << "Error: " << error.what() << endl;
+    return 1;
 }
