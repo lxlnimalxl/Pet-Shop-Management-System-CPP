@@ -24,7 +24,7 @@ This console-based application supports customer and seller roles, account manag
 ### 💼 Customers
 
 * View product catalog
-* Search for products (by name, category, price range)
+* Filter and sort products
 * Charge account balance
 * Purchase products (with balance deduction)
 * View personal orders and remaining balance
@@ -33,6 +33,7 @@ This console-based application supports customer and seller roles, account manag
 
 * Add new products (with validation)
 * View and remove products
+* Filter and sort products
 * See registered customers
 
 ### 💾 Persistent Storage
@@ -120,9 +121,16 @@ Dog Food,Food,Dogs,120.50
 
 ---
 
+## 🔎 Filtering and Sorting Products
+
+Choose **Filter and Sort Products** from either dashboard. Combine partial matches for product name, category, and suitable pet with an inclusive price range. Text filters ignore case for ASCII letters. Leave a field blank to skip that filter.
+
+Sort results by name (A–Z) or by price in either direction. Leave the sort option blank to use catalog order.
+
+---
+
 ## 📌 Notes
 
-* Product search supports **partial matches** for names and categories.
 * Invalid input is handled with clear error messages.
 * Commas in product names/categories are replaced with semicolons for file safety.
 * Orders are saved per customer and loaded at startup.
@@ -133,7 +141,6 @@ Dog Food,Food,Dogs,120.50
 
 * Admin panel
 * Graphical UI (Qt / SDL)
-* Product sorting and filtering
 * More pet types and categories
 
 ---

@@ -10,6 +10,7 @@
 #include <thread>
 #include <chrono>
 #include <sstream>
+#include <cmath>
 #include <cstdio>
 #include <stdexcept>
 #include <openssl/crypto.h>
@@ -131,6 +132,40 @@ bool replaceFile(const string& source, const string& destination) {
 #else
     return rename(source.c_str(), destination.c_str()) == 0;
 #endif
+}
+
+string toLower(string text) {
+    for (char& c : text) {
+        c = tolower(static_cast<unsigned char>(c));
+    }
+    return text;
+}
+
+bool readPriceFilter(const string& prompt, double minimum, double& price) {
+    string line;
+    while (true) {
+        cout << prompt;
+        if (!getline(cin, line)) {
+            return false;
+        }
+
+        istringstream input(line);
+        if ((input >> ws).eof()) {
+            return true;
+        }
+
+        double value;
+        if (!(input >> value) || !(input >> ws).eof() || !isfinite(value) || value < 0) {
+            typeWriter("Enter a valid non-negative price.", 50);
+        }
+        else if (value < minimum) {
+            typeWriter("Maximum price cannot be less than the minimum price.", 50);
+        }
+        else {
+            price = value;
+            return true;
+        }
+    }
 }
 }
 
@@ -537,10 +572,7 @@ public:
         cout << "  Role(customer/seller): ";
         cin >> role;
         //تبدیل به حروف کوچک
-        //cctype کتابخونه
-        for (char& c : role) {
-            c = tolower(static_cast<unsigned char>(c));
-        }
+        role = toLower(role);
 
         //جستجو برای وجود یوزر
         for (const auto& User : users) {
@@ -640,17 +672,82 @@ public:
     }
 
     void displayProducts() const {
+        displayProducts(products, "No products available in the shop.");
+    }
+
+    void filterAndSortProducts() const {
+        string name, category, suitableFor;
+        cin.ignore(numeric_limits<streamsize>::max(), '\n');
+        cout << "  Product name (leave empty to skip): ";
+        getline(cin, name);
+        cout << "  Category (leave empty to skip): ";
+        getline(cin, category);
+        cout << "  Suitable for which pets (leave empty to skip): ";
+        getline(cin, suitableFor);
+        name = toLower(name);
+        category = toLower(category);
+        suitableFor = toLower(suitableFor);
+
+        double minPrice = 0, maxPrice = numeric_limits<double>::max();
+        if (!readPriceFilter("  Minimum price (leave empty to skip): ", 0, minPrice) ||
+            !readPriceFilter("  Maximum price (leave empty to skip): ", minPrice, maxPrice)) {
+            return;
+        }
+
+        cout << "\n  1. Name (A-Z)" << endl;
+        cout << "  2. Price (low to high)" << endl;
+        cout << "  3. Price (high to low)" << endl;
+        string order;
+        while (true) {
+            cout << "  Sort by (leave empty for catalog order): ";
+            if (!getline(cin, order)) {
+                return;
+            }
+            if (order.empty() || order == "1" || order == "2" || order == "3") {
+                break;
+            }
+            typeWriter("Invalid sort option! Please try again.", 50);
+        }
+
+        vector<Product> matches;
+        for (const auto& product : products) {
+            if (toLower(product.GetName()).find(name) != string::npos &&
+                toLower(product.GetCategory()).find(category) != string::npos &&
+                toLower(product.GetSuitablefor()).find(suitableFor) != string::npos &&
+                product.GetPrice() >= minPrice && product.GetPrice() <= maxPrice) {
+                matches.push_back(product);
+            }
+        }
+
+        if (order == "1") {
+            stable_sort(matches.begin(), matches.end(), [](const Product& first, const Product& second) {
+                return toLower(first.GetName()) < toLower(second.GetName());
+                });
+        }
+        else if (!order.empty()) {
+            stable_sort(matches.begin(), matches.end(), [&order](const Product& first, const Product& second) {
+                return order == "2" ? first.GetPrice() < second.GetPrice() : first.GetPrice() > second.GetPrice();
+                });
+        }
+
+        displayProducts(matches, "No products found with these criteria.");
+        cout << "\nPress Enter to continue...";
+        cin.get();
+    }
+
+private:
+    void displayProducts(const vector<Product>& catalog, const string& emptyMessage) const {
         //خالی بودن محصولات
-        if (products.empty()) {
+        if (catalog.empty()) {
             cout << endl;
-            typeWriter("No products available in the shop.", 50);
+            typeWriter(emptyMessage, 50);
             return;
         }
 
         cout << "\n  " << left << setw(25) << "PRODUCT NAME" << " | " << setw(15) << "CATEGORY" << " | " << setw(20) << "SUITABLE FOR" << " | " << setw(10) << "PRICE" << endl;
         cout << "  " << string(80, '-') << endl;
         //نمایش اطلاعات
-        for (const auto& Product : products) {
+        for (const auto& Product : catalog) {
             Product.display();
             animateDelay(80);
         }
@@ -670,7 +767,7 @@ void Customer::displayMenu() {
         showName("CUSTOMER DASHBOARD");
         cout << "  Welcome, " << username << "!\n" << endl;
         cout << "  1. View Products" << endl;
-        cout << "  2. Search Products" << endl;
+        cout << "  2. Filter and Sort Products" << endl;
         cout << "  3. Charge Account" << endl;
         cout << "  4. Purchase Product" << endl;
         cout << "  5. View Orders" << endl;
@@ -696,83 +793,8 @@ void Customer::displayMenu() {
             break;
         }
         case 2: {
-            showName("PRODUCT SEARCH");
-            string name, category;
-            //کتابخونه limits
-            //numeric_limits بیشترین مقدار رابرای ما برمیگردونه
-            double minPrice = 0, maxPrice = numeric_limits<double>::max();
-
-            cout << "  Product name (leave empty to skip): ";
-            cin.ignore();
-            getline(cin, name);
-
-            cout << "  Category (leave empty to skip): ";
-            getline(cin, category);
-
-            //میمینیم
-            cout << "  Minimum price: ";
-            string minPriceStr;
-            getline(cin, minPriceStr);
-
-            // اصلاح باگ: مدیریت ورودی نامعتبر برای قیمت
-            if (!minPriceStr.empty()) {
-                try {
-                    minPrice = stod(minPriceStr);
-                }
-                catch (const std::exception& e) {
-                    typeWriter("Invalid minimum price! Using default.", 50);
-                    minPrice = 0;
-                }
-            }
-            //ماکسیمم
-            cout << "  Miximum price: ";
-            string maxPriceStr;
-            getline(cin, maxPriceStr);
-            //.empty = بررسی اینکه شی خالی هست یا نه
-            if (!maxPriceStr.empty()) {
-                try {
-                    maxPrice = stod(maxPriceStr);
-                }
-                catch (const std::exception& e) {
-                    typeWriter("Invalid maximum price! Using default.", 50);
-                    maxPrice = numeric_limits<double>::max();
-                }
-            }
-
-            cout << "\n  " << string(50, '=') << endl;
-            cout << "  SEARCH RESULTS" << endl;
-            cout << "  " << string(50, '=') << endl;
-
-            //جست و جو بر اساس اسم دسته بازه محصول
-            // اصلاح باگ: تنظیم صحیح متغیر found
-            bool found = false;
-            for (const auto& product : system->GetProduct()) {
-                bool match = true;
-                //شرط بررسی اسم محصول
-                //npos = نشانه عدم یافتن زیر رشته
-                if (!name.empty() && product.GetName().find(name) == string::npos) {
-                    match = false;
-                }
-                //npos = نشانه عدم یافتن زیر رشته
-                if (!category.empty() && product.GetCategory().find(category) == string::npos) {
-                    match = false;
-                }
-                //npos = نشانه عدم یافتن زیر رشته
-                if (product.GetPrice() < minPrice || product.GetPrice() > maxPrice) {
-                    match = false;
-                }
-                if (match) {
-                    product.display();
-                    found = true;
-                }
-            }
-
-            if (!found) {
-                typeWriter("No products found with these criteria.", 50);
-            }
-
-            cout << "\nPress Enter to continue...";
-            cin.get();
+            showName("FILTER AND SORT PRODUCTS");
+            system->filterAndSortProducts();
             break;
         }
         case 3: {
@@ -877,6 +899,7 @@ void Seller::displayMenu() {
         cout << "  2. View Products" << endl;
         cout << "  3. Remove Product" << endl;
         cout << "  4. View Customers" << endl;
+        cout << "  5. Filter and Sort Products" << endl;
         cout << "  0. Logout" << endl;
         cout << "\n  Enter your choice: ";
         // اصلاح باگ: مدیریت ورودی نامعتبر
@@ -957,6 +980,11 @@ void Seller::displayMenu() {
             cout << "\nPress Enter to continue...";
             cin.ignore();
             cin.get();
+            break;
+        }
+        case 5: {
+            showName("FILTER AND SORT PRODUCTS");
+            system->filterAndSortProducts();
             break;
         }
         case 0: {
